@@ -1,8 +1,8 @@
-# v0.1.0
+# ReadAsMe v0.1.0
 
 Initial public release.
 
-- macOS app wrapper for Qwen audiobook generation.
+- macOS app wrapper for local AI voice-cloned audiobook generation.
 - Bundled Python 3.12 runtime in the downloadable app.
 - First-run setup installs required Qwen/converter packages automatically.
 - No bundled voice sample or transcript; users choose their own files.
