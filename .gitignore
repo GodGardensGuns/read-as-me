@@ -1,0 +1,29 @@
+.DS_Store
+
+# SwiftPM build output
+QwenAudiobookMaker/.build/
+QwenAudiobookMaker/.swiftpm-cache/
+QwenAudiobookMaker/.clang-module-cache/
+QwenAudiobookMaker/dist/
+
+# Vendored build/runtime artifacts
+QwenAudiobookMaker/Vendor/python/
+QwenAudiobookMaker/*.zip
+*.zip
+*.app/
+
+# Local conversion data
+inputs/
+outputs/
+logs/
+gui_runs/
+*.wav
+*.mp3
+*.m4a
+*.aiff
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/

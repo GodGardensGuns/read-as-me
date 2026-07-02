@@ -1,0 +1,7 @@
+gradio_client>=2.5.0
+requests>=2.28.0
+PyPDF2>=3.0.0
+ebooklib>=0.18
+python-docx>=0.8.11
+docx2txt>=0.8
+beautifulsoup4>=4.11.0
