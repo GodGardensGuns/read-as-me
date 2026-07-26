@@ -4,8 +4,8 @@ set -euo pipefail
 MODE="${1:-run}"
 APP_NAME="ReadAsMe"
 BUNDLE_ID="com.godgardensguns.ReadAsMe"
-APP_VERSION="0.2.1"
-BUILD_VERSION="6"
+APP_VERSION="0.2.2"
+BUILD_VERSION="7"
 MIN_SYSTEM_VERSION="14.0"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

@@ -2,7 +2,9 @@
 
 # SwiftPM build output
 ReadAsMe/.build/
+ReadAsMe/.build-audit/
 ReadAsMe/.build-readasme/
+ReadAsMe/.build-readasme-tests/
 ReadAsMe/.swiftpm-cache/
 ReadAsMe/.swiftpm-cache-readasme/
 ReadAsMe/.clang-module-cache/

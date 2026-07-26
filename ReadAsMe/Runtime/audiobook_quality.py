@@ -20,10 +20,12 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import wave
 import zipfile
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Sequence
+from typing import Any, Callable, Iterable, Iterator, Sequence
 
 SCHEMA_VERSION = 1
 MODEL_ID = "nvidia/parakeet-tdt-0.6b-v3"
@@ -326,38 +328,161 @@ def source_suggestions(text: str) -> list[dict[str, Any]]:
     return suggestions
 
 
+def parakeet_cache_message() -> str:
+    hf_home = Path(os.environ.get("HF_HOME", "~/.cache/huggingface")).expanduser()
+    model_cache = hf_home / "hub" / "models--nvidia--parakeet-tdt-0.6b-v3"
+    incomplete = list((model_cache / "blobs").glob("*.incomplete"))
+    if incomplete:
+        received = sum(path.stat().st_size for path in incomplete if path.is_file())
+        return f"Downloading NVIDIA Parakeet V3: {received / 1_000_000_000:.2f} GB received (first use only)."
+    if any((model_cache / "snapshots").glob("*/model.safetensors")):
+        return "Loading the downloaded NVIDIA Parakeet V3 model into memory."
+    return "Downloading NVIDIA Parakeet V3 for the first quality check."
+
+
+def progress_heartbeat(
+    stop: threading.Event,
+    *,
+    progress: float,
+    message_factory: Callable[[], str],
+    interval: float = 10.0,
+) -> None:
+    while not stop.wait(interval):
+        emit("progress", phase="transcribing", progress=progress, message=message_factory())
+
+
+def token_timestamps_to_words(
+    tokens: Sequence[dict[str, Any]],
+    *,
+    offset: float = 0.0,
+) -> list[dict[str, Any]]:
+    """Join Parakeet's subword timestamps into readable, timestamped words."""
+    words: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    for item in tokens:
+        token = str(item.get("token", ""))
+        if not token or token == "<blank>":
+            continue
+        starts_word = token[:1].isspace()
+        fragment = token.strip() if starts_word else token
+        if not fragment:
+            continue
+        start = offset + float(item.get("start", 0.0))
+        end = offset + float(item.get("end", item.get("start", 0.0)))
+        if starts_word or current is None:
+            if current is not None:
+                words.append(current)
+            current = {"text": fragment, "start": start, "end": end, "confidence": 0.85}
+        else:
+            current["text"] += fragment
+            current["end"] = max(float(current["end"]), end)
+    if current is not None:
+        words.append(current)
+    return words
+
+
 def transcribe(proxy: Path) -> tuple[str, list[dict[str, Any]], str]:
     if os.environ.get("READASME_SKIP_ASR") == "1":
         return "", [], "disabled"
-    emit("progress", phase="transcribing", progress=0.32, message="Loading NVIDIA Parakeet V3.")
+    emit("progress", phase="transcribing", progress=0.32, message=parakeet_cache_message())
     try:
+        import numpy as np
         import torch
-        from transformers import pipeline
+        from transformers import AutoModelForTDT, AutoProcessor
     except ImportError as error:
         raise RuntimeError("Parakeet runtime is not installed. Reopen the audit to finish setup.") from error
 
     if torch.backends.mps.is_available():
-        device: str | int = "mps"
+        device = "mps"
     else:
-        device = -1
-    pipe = pipeline("automatic-speech-recognition", model=MODEL_ID, device=device)
-    result = pipe(str(proxy), return_timestamps="word", chunk_length_s=600, stride_length_s=1)
-    text = str(result.get("text", "")).strip() if isinstance(result, dict) else str(result)
-    words: list[dict[str, Any]] = []
-    if isinstance(result, dict):
-        for chunk in result.get("chunks", []) or []:
-            timestamp = chunk.get("timestamp") or (0.0, 0.0)
-            if timestamp[0] is None or timestamp[1] is None:
-                continue
-            words.append(
-                {
-                    "text": str(chunk.get("text", "")).strip(),
-                    "start": float(timestamp[0]),
-                    "end": float(timestamp[1]),
-                    "confidence": float(chunk.get("score", 0.85)),
-                }
+        device = "cpu"
+    load_stop = threading.Event()
+    load_thread = threading.Thread(
+        target=progress_heartbeat,
+        kwargs={
+            "stop": load_stop,
+            "progress": 0.32,
+            "message_factory": parakeet_cache_message,
+        },
+        daemon=True,
+    )
+    load_thread.start()
+    try:
+        processor = AutoProcessor.from_pretrained(MODEL_ID)
+        model = AutoModelForTDT.from_pretrained(MODEL_ID).to(device)
+        model.eval()
+    finally:
+        load_stop.set()
+        load_thread.join(timeout=1)
+
+    transcription_started = time.monotonic()
+
+    def transcription_message() -> str:
+        elapsed = max(1, int((time.monotonic() - transcription_started) / 60))
+        unit = "minute" if elapsed == 1 else "minutes"
+        return f"Transcribing with NVIDIA Parakeet V3 ({elapsed} {unit} elapsed)."
+
+    emit("progress", phase="transcribing", progress=0.40, message="Transcribing with NVIDIA Parakeet V3.")
+    transcribe_stop = threading.Event()
+    transcribe_thread = threading.Thread(
+        target=progress_heartbeat,
+        kwargs={
+            "stop": transcribe_stop,
+            "progress": 0.40,
+            "message_factory": transcription_message,
+        },
+        daemon=True,
+    )
+    transcribe_thread.start()
+    try:
+        with contextlib.closing(wave.open(str(proxy), "rb")) as source:
+            if source.getnchannels() != 1 or source.getsampwidth() != 2:
+                raise ValueError("Parakeet analysis input must be mono 16-bit PCM")
+            sample_rate = source.getframerate()
+            raw = source.readframes(source.getnframes())
+        samples = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+        chunk_samples = max(1, int(sample_rate * 240))
+        overlap_samples = max(1, int(sample_rate * 1.5))
+        words: list[dict[str, Any]] = []
+        cursor = 0
+        total = max(1, len(samples))
+        while cursor < len(samples):
+            end = min(len(samples), cursor + chunk_samples)
+            model_inputs = processor(
+                samples[cursor:end],
+                sampling_rate=sample_rate,
+                return_tensors="pt",
             )
-    return text, words, "mps" if device == "mps" else "cpu"
+            model_inputs = {key: value.to(device) for key, value in model_inputs.items()}
+            with torch.inference_mode():
+                generated = model.generate(**model_inputs)
+            _, timestamp_batches = processor.decode(
+                generated.sequences,
+                durations=generated.durations,
+            )
+            token_timestamps = timestamp_batches[0] if timestamp_batches else []
+            chunk_words = token_timestamps_to_words(token_timestamps, offset=cursor / sample_rate)
+            if end < len(samples):
+                commit_before = (end - overlap_samples / 2) / sample_rate
+                chunk_words = [word for word in chunk_words if float(word["end"]) <= commit_before]
+            if words:
+                committed_until = float(words[-1]["end"])
+                chunk_words = [word for word in chunk_words if float(word["start"]) >= committed_until]
+            words.extend(chunk_words)
+            emit(
+                "progress",
+                phase="transcribing",
+                progress=min(0.68, 0.40 + 0.28 * end / total),
+                message=f"Transcribing with NVIDIA Parakeet V3 ({end / total:.0%} complete).",
+            )
+            if end >= len(samples):
+                break
+            cursor = end - overlap_samples
+    finally:
+        transcribe_stop.set()
+        transcribe_thread.join(timeout=1)
+    text = " ".join(str(word["text"]).strip() for word in words if str(word["text"]).strip())
+    return text, words, device
 
 
 def finding(

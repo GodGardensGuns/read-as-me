@@ -28,6 +28,42 @@ def write_fixture(path: Path) -> None:
 
 
 class AudiobookQualityTests(unittest.TestCase):
+    def test_parakeet_cache_message_reports_download_and_cached_model(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            model_cache = root / "hub" / "models--nvidia--parakeet-tdt-0.6b-v3"
+            blobs = model_cache / "blobs"
+            blobs.mkdir(parents=True)
+            incomplete = blobs / "weights.incomplete"
+            incomplete.write_bytes(b"x" * 1024)
+            previous = os.environ.get("HF_HOME")
+            os.environ["HF_HOME"] = str(root)
+            try:
+                self.assertIn("Downloading NVIDIA Parakeet V3", quality.parakeet_cache_message())
+                incomplete.unlink()
+                snapshot = model_cache / "snapshots" / "revision"
+                snapshot.mkdir(parents=True)
+                (snapshot / "model.safetensors").touch()
+                self.assertIn("Loading the downloaded", quality.parakeet_cache_message())
+            finally:
+                if previous is None:
+                    os.environ.pop("HF_HOME", None)
+                else:
+                    os.environ["HF_HOME"] = previous
+
+    def test_parakeet_subword_timestamps_become_timestamped_words(self):
+        tokens = [
+            {"token": " Dor", "start": 0.24, "end": 0.40},
+            {"token": "othy", "start": 0.40, "end": 0.72},
+            {"token": " liv", "start": 0.88, "end": 1.04},
+            {"token": "ed", "start": 1.04, "end": 1.20},
+            {"token": ".", "start": 1.20, "end": 1.20},
+        ]
+        words = quality.token_timestamps_to_words(tokens, offset=10.0)
+        self.assertEqual([word["text"] for word in words], ["Dorothy", "lived."])
+        self.assertAlmostEqual(words[0]["start"], 10.24)
+        self.assertAlmostEqual(words[1]["end"], 11.20)
+
     def test_detects_long_internal_pause(self):
         with tempfile.TemporaryDirectory() as folder:
             audio = Path(folder) / "fixture.wav"

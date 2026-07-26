@@ -7,7 +7,6 @@ AUDIT_VENV="$APP_SUPPORT/venvs/parakeet-audit"
 BUNDLED_PYTHON="$BUNDLED_RUNTIME/python/bin/python3.12"
 REQUIREMENTS="$BUNDLED_RUNTIME/requirements-audit.txt"
 STAMP="$AUDIT_VENV/.readasme-audit-version"
-VERSION="$(cat "$BUNDLED_RUNTIME/runtime-version.txt")"
 
 export PIP_DISABLE_PIP_VERSION_CHECK=1
 export PIP_CACHE_DIR="$APP_SUPPORT/cache/pip"
@@ -18,6 +17,8 @@ if [[ ! -x "$BUNDLED_PYTHON" ]]; then
   echo "[ERROR] The bundled Python runtime is missing."
   exit 1
 fi
+
+VERSION="$("$BUNDLED_PYTHON" -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$REQUIREMENTS")"
 
 if [[ -x "$AUDIT_VENV/bin/python" && -f "$STAMP" && "$(cat "$STAMP")" == "$VERSION" ]]; then
   echo "[OK] Parakeet audit runtime is already installed."
