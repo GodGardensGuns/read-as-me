@@ -12,22 +12,47 @@ struct ContentView: View {
             HStack(spacing: 0) {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 18) {
-                        BookPickerView(controller: controller)
-                        VoicePickerView(controller: controller)
+                        Picker("Workflow", selection: $controller.workflowMode) {
+                            ForEach(WorkflowMode.allCases) { mode in
+                                Text(mode.rawValue).tag(mode)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+
+                        switch controller.workflowMode {
+                        case .generate:
+                            BookPickerView(controller: controller)
+                            VoicePickerView(controller: controller)
+                        case .auditExisting:
+                            AuditSetupView(controller: controller)
+                        }
+
                         OutputPickerView(controller: controller)
-                        ServerControlView(controller: controller)
-                        ConversionControlView(controller: controller)
+
+                        if controller.workflowMode == .generate {
+                            ServerControlView(controller: controller)
+                            ConversionControlView(controller: controller)
+                        }
                     }
                     .padding(20)
                 }
-                .frame(width: 360)
+                .frame(width: 390)
 
                 Divider()
 
-                ProgressSummaryView(controller: controller) {
-                    isShowingLogs = true
+                Group {
+                    if let report = controller.auditReport {
+                        AuditResultsView(controller: controller, report: report) {
+                            isShowingLogs = true
+                        }
+                    } else {
+                        ProgressSummaryView(controller: controller) {
+                            isShowingLogs = true
+                        }
+                        .padding(20)
+                    }
                 }
-                .padding(20)
             }
         }
         .sheet(isPresented: $isShowingLogs) {
@@ -35,6 +60,14 @@ struct ContentView: View {
                 isShowingLogs = false
             }
             .frame(minWidth: 720, minHeight: 520)
+        }
+        .sheet(isPresented: $controller.isShowingSourceReview) {
+            SourceTextReviewView(controller: controller)
+                .frame(minWidth: 760, minHeight: 560)
+                .interactiveDismissDisabled()
+        }
+        .onChange(of: controller.workflowMode) { _, _ in
+            controller.workflowDidChange()
         }
     }
 
@@ -46,12 +79,17 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text("ReadAsMe")
                     .font(.title2.weight(.semibold))
-                Text(controller.conversionState.label)
+                Text(controller.auditState.isBusy || controller.auditReport != nil
+                     ? controller.auditState.label
+                     : controller.conversionState.label)
                     .foregroundStyle(.secondary)
                     .font(.subheadline)
             }
             Spacer()
             StatusPill(title: controller.serverState.rawValue, systemImage: "server.rack")
+            if let report = controller.auditReport {
+                StatusPill(title: report.summary.status, systemImage: report.summary.criticalCount > 0 ? "exclamationmark.triangle" : "checkmark.seal")
+            }
             if case .complete = controller.conversionState {
                 Button {
                     controller.openLatestOutput()

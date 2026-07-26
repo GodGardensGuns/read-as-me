@@ -15,7 +15,7 @@ struct ServerControlView: View {
                     Label("Start", systemImage: "play.fill")
                         .frame(maxWidth: .infinity)
                 }
-                .disabled(controller.serverState != .stopped)
+                .disabled(controller.serverState != .stopped || controller.conversionState.isBusy || controller.auditState.isBusy)
 
                 Button {
                     controller.stopServer()
@@ -23,7 +23,18 @@ struct ServerControlView: View {
                     Label("Stop", systemImage: "stop.fill")
                         .frame(maxWidth: .infinity)
                 }
-                .disabled(controller.serverState == .stopped)
+                .disabled(
+                    controller.serverState == .stopped
+                        || controller.serverState == .external
+                        || controller.conversionState.isBusy
+                        || controller.auditState.isBusy
+                )
+            }
+
+            if controller.serverState == .external {
+                Text("A compatible voice engine is already running outside ReadAsMe.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
         }
     }

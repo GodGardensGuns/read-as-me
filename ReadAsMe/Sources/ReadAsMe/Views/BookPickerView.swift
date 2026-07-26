@@ -17,5 +17,6 @@ struct BookPickerView: View {
                     .frame(maxWidth: .infinity)
             }
         }
+        .disabled(controller.conversionState.isBusy || controller.auditState.isBusy)
     }
 }

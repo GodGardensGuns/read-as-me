@@ -23,6 +23,7 @@ import xml.etree.ElementTree as ET
 from html import unescape
 import re
 import wave
+import json
 from datetime import datetime
 import PyPDF2
 import ebooklib
@@ -61,14 +62,16 @@ CUSTOM_VOICE_MODEL_ID = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
 VOICE_CLONE_LANGUAGE = "English"
 VOICE_CLONE_USE_XVECTOR_ONLY = False
 VOICE_CLONE_MODEL_SIZE = "1.7B"  # Always use 1.7B
-VOICE_CLONE_MAX_CHUNK_CHARS = 200
+VOICE_CLONE_MAX_CHUNK_CHARS = 300
 VOICE_CLONE_CHUNK_GAP = 0
 VOICE_CLONE_SEED = -1
+VOICE_GENERATION_PROFILE = "natural-narration-v2"
 
 # Processing Settings
 BOOKS_FOLDER = "book_to_convert"  # Input folder
 AUDIOBOOKS_FOLDER = "audiobooks"  # Output folder
-CHUNK_SIZE_WORDS = 180  # Keep calls short enough for the current Qwen Gradio API
+CHUNK_SIZE_WORDS = 60
+CHUNK_SIZE_CHARACTERS = VOICE_CLONE_MAX_CHUNK_CHARS
 MAX_WORKERS = 1  # Keep at 1 to avoid rate limiting
 AUDIO_FORMAT = "wav"
 MIN_DELAY_BETWEEN_CHUNKS = 1  # Reduced delay
@@ -137,10 +140,12 @@ class QwenAudiobookConverter:
         voice_mode: str = "custom_voice",
         voice_clone_ref_audio: Optional[str] = None,
         voice_clone_ref_text: Optional[str] = None,
+        retain_chunks: bool = False,
     ):
         self.voice_mode = voice_mode
         self.voice_clone_ref_audio = voice_clone_ref_audio
         self.voice_clone_ref_text = (voice_clone_ref_text or "").strip()
+        self.retain_chunks = retain_chunks
         self.voice_clone_use_xvector_only = VOICE_CLONE_USE_XVECTOR_ONLY
         self.setup_logging()
         self.setup_directories()
@@ -397,7 +402,7 @@ class QwenAudiobookConverter:
             ref_name = Path(self.voice_clone_ref_audio).name if self.voice_clone_ref_audio else ""
             transcript_hash = hashlib.md5(self.voice_clone_ref_text.encode()).hexdigest()
             voice_key = f"{ref_name}_{transcript_hash}_xvec_{self.voice_clone_use_xvector_only}"
-        content = f"{text}_{self.voice_mode}_{voice_key}"
+        content = f"{text}_{self.voice_mode}_{voice_key}_{VOICE_GENERATION_PROFILE}"
         hash_obj = hashlib.md5(content.encode())
         return Path("cache/audio_chunks") / f"{hash_obj.hexdigest()}.wav"
 
@@ -429,7 +434,7 @@ class QwenAudiobookConverter:
         for item_id, linear in book.spine:
             try:
                 item = book.get_item_by_id(item_id)
-                if item and isinstance(item, ebooklib.ITEM_DOCUMENT):
+                if item and item.get_type() == ebooklib.ITEM_DOCUMENT:
                     content = item.get_body_content()
                     if content:
                         if isinstance(content, bytes):
@@ -559,57 +564,85 @@ class QwenAudiobookConverter:
         return self._clean_text(text) if text else ""
 
     def _clean_text(self, text: str) -> str:
-        """Clean and normalize text"""
+        """Normalize text without discarding paragraph-level narration cues."""
         if not text:
             return ""
-        text = re.sub(r'\s+', ' ', text)
-        text = text.replace('\n', ' ')
-        text = re.sub(r'\b\d{1,3}\b(?=\s|$)', '', text)
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        text = re.sub(r'[^\S\n]+', ' ', text)
+        text = re.sub(r' *\n *', '\n', text)
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        text = re.sub(r'(?<!\n)\n(?!\n)', ' ', text)
         return text.strip()
 
     def split_into_chunks(self, text: str) -> List[str]:
-        """Split text into manageable chunks"""
+        """Split at paragraphs and sentence/clause boundaries for stable narration."""
         if not text.strip():
             return []
 
-        sentences = re.split(r'(?<=[.!?])\s+', text)
-        chunks = []
-        current_chunk = ""
-        current_words = 0
+        def fits(candidate: str) -> bool:
+            return (
+                len(candidate) <= CHUNK_SIZE_CHARACTERS
+                and len(candidate.split()) <= CHUNK_SIZE_WORDS
+            )
 
-        for sentence in sentences:
-            sentence_words = len(sentence.split())
+        def split_oversized(segment: str) -> List[str]:
+            if fits(segment):
+                return [segment]
 
-            if sentence_words > CHUNK_SIZE_WORDS:
-                if current_chunk:
-                    chunks.append(current_chunk.strip())
-                    current_chunk = ""
-                    current_words = 0
-
-                # Split long sentences
-                parts = re.split(r'[,;:]', sentence)
-                for part in parts:
-                    part_words = len(part.split())
-                    if current_words + part_words <= CHUNK_SIZE_WORDS:
-                        current_chunk += part + " "
-                        current_words += part_words
+            clauses = [
+                clause.strip()
+                for clause in re.split(r'(?<=[,;:—–])\s+', segment)
+                if clause.strip()
+            ]
+            if len(clauses) > 1:
+                clause_chunks: List[str] = []
+                current = ""
+                for clause in clauses:
+                    candidate = f"{current} {clause}".strip()
+                    if current and not fits(candidate):
+                        clause_chunks.extend(split_oversized(current))
+                        current = clause
                     else:
-                        if current_chunk:
-                            chunks.append(current_chunk.strip())
-                        current_chunk = part + " "
-                        current_words = part_words
-            else:
-                if current_words + sentence_words <= CHUNK_SIZE_WORDS:
-                    current_chunk += sentence + " "
-                    current_words += sentence_words
-                else:
-                    if current_chunk:
-                        chunks.append(current_chunk.strip())
-                    current_chunk = sentence + " "
-                    current_words = sentence_words
+                        current = candidate
+                if current:
+                    clause_chunks.extend(split_oversized(current))
+                return clause_chunks
 
-        if current_chunk.strip():
-            chunks.append(current_chunk.strip())
+            words = segment.split()
+            word_chunks: List[str] = []
+            current_words: List[str] = []
+            for word in words:
+                candidate_words = [*current_words, word]
+                candidate = " ".join(candidate_words)
+                if current_words and not fits(candidate):
+                    word_chunks.append(" ".join(current_words))
+                    current_words = [word]
+                else:
+                    current_words = candidate_words
+            if current_words:
+                word_chunks.append(" ".join(current_words))
+            return word_chunks
+
+        chunks: List[str] = []
+        paragraphs = [part.strip() for part in re.split(r'\n{2,}', text) if part.strip()]
+
+        for paragraph in paragraphs:
+            sentences = [
+                sentence.strip()
+                for sentence in re.split(r'(?<=[.!?])\s+', paragraph)
+                if sentence.strip()
+            ]
+            current = ""
+            for sentence in sentences:
+                for segment in split_oversized(sentence):
+                    candidate = f"{current} {segment}".strip()
+                    if current and not fits(candidate):
+                        chunks.append(current)
+                        current = segment
+                    else:
+                        current = candidate
+            if current:
+                chunks.append(current)
 
         return [chunk for chunk in chunks if chunk.strip()]
 
@@ -671,12 +704,12 @@ class QwenAudiobookConverter:
                 raise RuntimeError("No valid chunks found")
 
             if missing_chunks:
-                self.logger.warning(f"Missing chunks: {missing_chunks}")
+                self.logger.error(f"Refusing to create an incomplete audiobook; missing chunks: {missing_chunks}")
+                output_path.unlink(missing_ok=True)
+                return False
 
             self.logger.info(f"Audiobook saved: {output_path} ({successful}/{total_chunks} chunks)")
             print(f"[INFO] Saved audiobook: {output_path.name} ({successful}/{total_chunks} chunks)")
-            if missing_chunks:
-                print(f"[WARNING] Missing chunks: {missing_chunks}")
             return True
 
         except Exception as e:
@@ -746,6 +779,26 @@ class QwenAudiobookConverter:
 
             # Process chunks - process in order to ensure correct naming
             chunk_args = [(i + 1, chunk) for i, chunk in enumerate(chunks)]
+            manifest_path = Path("chunks") / "manifest.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "source_file": str(file_path),
+                        "chunks": [
+                            {
+                                "index": index,
+                                "text": chunk_text,
+                                "audio": f"chunk_{index:04d}.wav",
+                            }
+                            for index, chunk_text in chunk_args
+                        ],
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
 
             print(f"\n{'=' * 50}")
             print(f"PROCESSING {total_chunks} CHUNKS")
@@ -797,13 +850,36 @@ class QwenAudiobookConverter:
                 return False
 
             if successful_chunks < total_chunks:
-                self.logger.warning(f"Only {successful_chunks}/{total_chunks} chunks succeeded. Proceeding with partial audiobook.")
+                self.logger.error(
+                    f"Only {successful_chunks}/{total_chunks} chunks succeeded. "
+                    "No incomplete audiobook will be created."
+                )
+                print(
+                    f"[FAIL] {total_chunks - successful_chunks} chunk(s) failed; "
+                    "the audiobook was not created."
+                )
+                self.cleanup_chunks()
+                return False
 
-            # Combine chunks (only the successful ones)
+            # Combine only after every chunk has succeeded.
             output_path = Path(AUDIOBOOKS_FOLDER) / f"{file_path.stem}.{AUDIO_FORMAT}"
             success = self.combine_chunks(total_chunks, output_path, results)
 
             if success:
+                chunk_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                cursor = 0.0
+                for item in chunk_manifest["chunks"]:
+                    chunk_path = Path("chunks") / item["audio"]
+                    with wave.open(str(chunk_path), "rb") as chunk_wave:
+                        duration = chunk_wave.getnframes() / max(chunk_wave.getframerate(), 1)
+                    item["start"] = cursor
+                    item["end"] = cursor + duration
+                    item["duration"] = duration
+                    cursor += duration
+                manifest_path.write_text(
+                    json.dumps(chunk_manifest, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
                 duration = time.time() - start_time
                 minutes = int(duration // 60)
                 seconds = int(duration % 60)
@@ -812,8 +888,9 @@ class QwenAudiobookConverter:
             else:
                 self.logger.error("Failed to combine chunks into final audiobook")
 
-            # Always cleanup, even on failure
-            self.cleanup_chunks()
+            # Keep successful chunks for ReadAsMe's audit/repair session when requested.
+            if not (success and self.retain_chunks):
+                self.cleanup_chunks()
             return success
 
         except Exception as e:
@@ -824,7 +901,7 @@ class QwenAudiobookConverter:
             self.cleanup_chunks()
             return False
 
-    def run(self):
+    def run(self) -> bool:
         """Main conversion process"""
         print("=" * 70)
         print("QWEN-BASED AUDIOBOOK CONVERTER")
@@ -866,7 +943,7 @@ class QwenAudiobookConverter:
                         "The system will send this text to the Qwen API for voice generation. "
                         "You can replace this file with your own books to convert.")
             print(f"[INFO] Created sample file: {sample_file}")
-            return
+            return False
 
         print(f"[INFO] Found {len(book_files)} books to convert")
 
@@ -899,6 +976,7 @@ class QwenAudiobookConverter:
 
         if successful > 0:
             print(f"\n[INFO] Audiobooks saved to: {AUDIOBOOKS_FOLDER}/")
+        return total > 0 and successful == total
 
 
 def main():
@@ -936,6 +1014,12 @@ Examples:
         type=str,
         help="Path to exact transcript text for the reference audio. Improves voice cloning and avoids x-vector-only mode."
     )
+
+    parser.add_argument(
+        "--retain-chunks",
+        action="store_true",
+        help="Keep generated chunk audio and chunks/manifest.json for post-generation auditing."
+    )
     
     args = parser.parse_args()
     
@@ -966,11 +1050,14 @@ Examples:
         converter = QwenAudiobookConverter(
             voice_mode=voice_mode,
             voice_clone_ref_audio=voice_clone_ref_audio,
-            voice_clone_ref_text=voice_clone_ref_text
+            voice_clone_ref_text=voice_clone_ref_text,
+            retain_chunks=args.retain_chunks,
         )
-        converter.run()
+        if not converter.run():
+            sys.exit(1)
     except KeyboardInterrupt:
         print("\n[WARNING] Shutdown requested by user")
+        sys.exit(130)
     except Exception as e:
         print(f"[FATAL] Fatal error: {e}")
         import traceback

@@ -13,6 +13,11 @@ let package = Package(
         .executableTarget(
             name: "ReadAsMe",
             path: "Sources/ReadAsMe"
+        ),
+        .testTarget(
+            name: "ReadAsMeTests",
+            dependencies: ["ReadAsMe"],
+            path: "Tests/ReadAsMeTests"
         )
     ]
 )

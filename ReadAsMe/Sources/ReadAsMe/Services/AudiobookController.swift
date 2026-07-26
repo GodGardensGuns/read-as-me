@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import Foundation
 import SwiftUI
 import UniformTypeIdentifiers
@@ -20,17 +21,54 @@ final class AudiobookController: ObservableObject {
     @Published var progressDetail: String = "Choose a book to convert."
     @Published var completedChunks: Int = 0
     @Published var totalChunks: Int = 0
+    @Published var workflowMode: WorkflowMode = .generate
+    @Published var selectedAuditAudioURL: URL?
+    @Published var selectedExpectedTextURL: URL?
+    @Published var qualityProfile: QualityProfile = .natural
+    @Published var outputSameFormat: Bool = true
+    @Published var auditState: AuditState = .idle
+    @Published var auditReport: AuditReport?
+    @Published var selectedFindingIDs: Set<String> = []
+    @Published var latestAuditReportURL: URL?
+    @Published var latestMarkdownReportURL: URL?
+    @Published var latestRepairedOutputURL: URL?
+    @Published var auditModelNoticeAccepted = false
+    @Published var isShowingSourceReview = false
+    @Published var sourceTextSuggestions: [SourceTextSuggestion] = []
 
-    private var serverProcess: RunningProcess?
+    var serverProcess: RunningProcess?
     private var converterProcess: RunningProcess?
     private var bootstrapProcess: RunningProcess?
+    var qualityProcess: RunningProcess?
+    var auditBootstrapProcess: RunningProcess?
+    var qualityOutputBuffer = ""
+    var auditPlayer: AVPlayer?
+    var sourceReviewProcess: RunningProcess?
+    var sourceReviewContinuation: CheckedContinuation<[SourceTextSuggestion], Never>?
+    var sourceReviewText = ""
     private var diagnosticsLogged = false
+    var cancellationRequested = false
+    private var serverStartCancelled = false
 
     var canConvert: Bool {
-        selectedBookURL != nil
+        hasSelectedBook
             && hasVoiceSample
             && hasUsableTranscript
             && !conversionState.isBusy
+            && serverState != .starting
+    }
+
+    var canStartExistingAudit: Bool {
+        guard let selectedAuditAudioURL else { return false }
+        return FileManager.default.fileExists(atPath: selectedAuditAudioURL.path)
+            && !auditState.isBusy
+            && !conversionState.isBusy
+            && auditModelNoticeAccepted
+    }
+
+    private var hasSelectedBook: Bool {
+        guard let selectedBookURL else { return false }
+        return FileManager.default.fileExists(atPath: selectedBookURL.path)
     }
 
     private var hasVoiceSample: Bool {
@@ -64,6 +102,7 @@ final class AudiobookController: ObservableObject {
     }
 
     func chooseBook() {
+        guard !conversionState.isBusy else { return }
         let panel = NSOpenPanel()
         panel.title = "Choose Book"
         panel.allowedContentTypes = [.epub, .pdf, .plainText]
@@ -75,7 +114,17 @@ final class AudiobookController: ObservableObject {
         }
     }
 
+    func workflowDidChange() {
+        guard !conversionState.isBusy, !auditState.isBusy, auditReport == nil else { return }
+        progressFraction = 0
+        progressTitle = "Ready"
+        progressDetail = workflowMode == .generate
+            ? "Choose a book to convert."
+            : "Choose an audiobook to audit."
+    }
+
     func chooseVoiceSample() {
+        guard !conversionState.isBusy else { return }
         let panel = NSOpenPanel()
         panel.title = "Choose Voice Sample"
         panel.allowedContentTypes = [.audio]
@@ -88,6 +137,7 @@ final class AudiobookController: ObservableObject {
     }
 
     func chooseVoiceTranscript() {
+        guard !conversionState.isBusy else { return }
         let panel = NSOpenPanel()
         panel.title = "Choose Voice Transcript"
         panel.allowedContentTypes = [.plainText, .text]
@@ -106,6 +156,7 @@ final class AudiobookController: ObservableObject {
     }
 
     func clearVoiceSelection() {
+        guard !conversionState.isBusy else { return }
         voiceSampleURL = nil
         voiceTranscriptURL = nil
         voiceTranscriptText = ""
@@ -114,6 +165,7 @@ final class AudiobookController: ObservableObject {
     }
 
     func chooseOutputFolder() {
+        guard !conversionState.isBusy else { return }
         let panel = NSOpenPanel()
         panel.title = "Choose Output Folder"
         panel.canChooseFiles = false
@@ -127,15 +179,21 @@ final class AudiobookController: ObservableObject {
     }
 
     func startServer() {
-        guard serverState == .stopped else { return }
+        guard serverState == .stopped, !conversionState.isBusy else { return }
+        serverStartCancelled = false
         serverState = .starting
         setProgress(fraction: 0.02, title: "Preparing Runtime", detail: "Checking local Qwen setup.")
         Task {
             do {
                 try await ensureRuntimeReady()
+                guard !serverStartCancelled else { return }
                 try startServerProcess()
             } catch {
                 serverState = .stopped
+                if serverStartCancelled {
+                    setProgress(fraction: 0, title: "Stopped", detail: "Voice engine startup was stopped.", allowDecrease: true)
+                    return
+                }
                 setProgress(fraction: progressFraction, title: "Setup Failed", detail: error.localizedDescription)
                 appendLog("Failed to start Qwen: \(error.localizedDescription)")
             }
@@ -143,8 +201,10 @@ final class AudiobookController: ObservableObject {
     }
 
     func stopServer() {
+        guard !conversionState.isBusy else { return }
         if bootstrapProcess != nil {
             appendLog("Stopping runtime setup...")
+            serverStartCancelled = true
             bootstrapProcess?.process.terminate()
             bootstrapProcess = nil
         }
@@ -154,28 +214,67 @@ final class AudiobookController: ObservableObject {
             return
         }
         appendLog("Stopping Qwen server...")
-        bootstrapProcess?.process.terminate()
-        bootstrapProcess = nil
+        serverStartCancelled = true
         serverProcess.process.terminate()
         self.serverProcess = nil
         serverState = .stopped
+        setProgress(fraction: 0, title: "Stopped", detail: "Voice engine is stopped.", allowDecrease: true)
     }
 
     func convertSelectedBook() {
         guard let selectedBookURL, !conversionState.isBusy else { return }
+        if !auditModelNoticeAccepted {
+            let alert = NSAlert()
+            alert.messageText = "Enable automatic audiobook quality checks?"
+            alert.informativeText = "The first quality check installs NVIDIA Parakeet and downloads about 2.5 GB of model data. Analysis stays on this Mac."
+            alert.addButton(withTitle: "Enable and Continue")
+            alert.addButton(withTitle: "Cancel")
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+            auditModelNoticeAccepted = true
+        }
         Task {
             await convert(bookURL: selectedBookURL)
         }
     }
 
     func cancelConversion() {
+        guard conversionState.isBusy, !cancellationRequested else { return }
+        cancellationRequested = true
         appendLog("Cancel requested.")
         converterProcess?.process.terminate()
         converterProcess = nil
         bootstrapProcess?.process.terminate()
         bootstrapProcess = nil
-        conversionState = .idle
-        setProgress(fraction: 0, title: "Cancelled", detail: "Conversion was cancelled.", allowDecrease: true)
+        sourceReviewProcess?.process.terminate()
+        sourceReviewProcess = nil
+        sourceReviewContinuation?.resume(returning: [])
+        sourceReviewContinuation = nil
+        isShowingSourceReview = false
+        if serverState == .starting {
+            serverStartCancelled = true
+            serverProcess?.process.terminate()
+            serverProcess = nil
+            serverState = .stopped
+        }
+        setProgress(
+            fraction: progressFraction,
+            title: "Cancelling",
+            detail: "Waiting for the current operation to stop."
+        )
+    }
+
+    func cancelQualityOperation() {
+        guard auditState.isBusy else { return }
+        cancellationRequested = true
+        qualityProcess?.process.terminate()
+        qualityProcess = nil
+        sourceReviewProcess?.process.terminate()
+        sourceReviewProcess = nil
+        sourceReviewContinuation?.resume(returning: [])
+        sourceReviewContinuation = nil
+        auditBootstrapProcess?.process.terminate()
+        auditBootstrapProcess = nil
+        setProgress(fraction: progressFraction, title: "Cancelling", detail: "Stopping the quality operation.")
     }
 
     func openOutputFolder() {
@@ -188,10 +287,16 @@ final class AudiobookController: ObservableObject {
     }
 
     func terminateOwnedProcesses() {
+        cancellationRequested = true
+        serverStartCancelled = true
         converterProcess?.process.terminate()
         converterProcess = nil
         bootstrapProcess?.process.terminate()
         bootstrapProcess = nil
+        auditBootstrapProcess?.process.terminate()
+        auditBootstrapProcess = nil
+        qualityProcess?.process.terminate()
+        qualityProcess = nil
         serverProcess?.process.terminate()
         serverProcess = nil
     }
@@ -206,6 +311,7 @@ final class AudiobookController: ObservableObject {
     }
 
     private func convert(bookURL: URL) async {
+        cancellationRequested = false
         conversionState = .preparing
         latestOutputURL = nil
         completedChunks = 0
@@ -214,15 +320,22 @@ final class AudiobookController: ObservableObject {
 
         do {
             logDiagnosticsIfNeeded()
+            try validateInputFiles(bookURL: bookURL)
             try await ensureRuntimeReady()
-            try validateRequiredFiles()
+            try throwIfCancellationRequested()
             try FileManager.default.createDirectory(at: AppPaths.runRoot, withIntermediateDirectories: true)
             try FileManager.default.createDirectory(at: outputFolderURL, withIntermediateDirectories: true)
 
             if !(await isServerReady()) {
-                setProgress(fraction: 0.06, title: "Starting Qwen", detail: "Waiting for the local server.")
+                try throwIfCancellationRequested()
+                setProgress(
+                    fraction: 0.06,
+                    title: "Starting Qwen",
+                    detail: "Waiting for the local server. The first launch downloads the speech model."
+                )
                 try startServerProcess()
-                let ready = await waitForServerReady(timeoutSeconds: 240)
+                let ready = await waitForServerReady()
+                try throwIfCancellationRequested()
                 guard ready else {
                     throw AppError.message("Qwen server is not ready.")
                 }
@@ -238,11 +351,26 @@ final class AudiobookController: ObservableObject {
             try FileManager.default.createDirectory(at: audiobookFolder, withIntermediateDirectories: true)
             let runTranscript = try transcriptURLForConversion(in: runDirectory)
 
-            let stagedBook = bookFolder.appendingPathComponent(bookURL.lastPathComponent)
-            if FileManager.default.fileExists(atPath: stagedBook.path) {
-                try FileManager.default.removeItem(at: stagedBook)
+            let reviewPayload = try await reviewSourceText(bookURL, in: runDirectory)
+            var auditExpectedTextURL: URL = bookURL
+            if !reviewPayload.suggestions.isEmpty {
+                sourceReviewText = reviewPayload.text
+                let reviewedSuggestions = await waitForSourceTextReview(reviewPayload.suggestions)
+                let accepted = reviewedSuggestions.filter(\.accepted)
+                if !accepted.isEmpty {
+                    let reviewedBook = bookFolder.appendingPathComponent("reviewed-\(bookURL.deletingPathExtension().lastPathComponent).txt")
+                    try applySourceSuggestions(accepted, to: reviewPayload.text)
+                        .write(to: reviewedBook, atomically: true, encoding: .utf8)
+                    auditExpectedTextURL = reviewedBook
+                    appendLog("Applied \(accepted.count) reviewed source-text corrections to the staged copy.")
+                } else {
+                    let stagedBook = bookFolder.appendingPathComponent(bookURL.lastPathComponent)
+                    try FileManager.default.copyItem(at: bookURL, to: stagedBook)
+                }
+            } else {
+                let stagedBook = bookFolder.appendingPathComponent(bookURL.lastPathComponent)
+                try FileManager.default.copyItem(at: bookURL, to: stagedBook)
             }
-            try FileManager.default.copyItem(at: bookURL, to: stagedBook)
 
             appendLog("Run folder: \(runDirectory.path)")
             appendLog("Converting \(bookURL.lastPathComponent)...")
@@ -250,6 +378,7 @@ final class AudiobookController: ObservableObject {
             setProgress(fraction: 0.12, title: "Converting", detail: "Starting the audiobook converter.")
 
             let status = try await runConverter(in: runDirectory, transcriptURL: runTranscript)
+            try throwIfCancellationRequested()
             guard status == 0 else {
                 throw AppError.message("Converter exited with status \(status).")
             }
@@ -262,16 +391,29 @@ final class AudiobookController: ObservableObject {
             let finalOutput = try copyOutput(generatedFile, originalBook: bookURL)
             latestOutputURL = finalOutput
             conversionState = .complete(finalOutput)
-            setProgress(fraction: 1, title: "Complete", detail: finalOutput.lastPathComponent)
+            setProgress(fraction: 1, title: "Audio Saved", detail: "Starting the automatic quality check.")
             appendLog("Saved: \(finalOutput.path)")
+            let chunkManifest = runDirectory.appendingPathComponent("chunks/manifest.json")
+            await startGeneratedAudit(
+                audioURL: finalOutput,
+                expectedTextURL: auditExpectedTextURL,
+                generatedChunksURL: FileManager.default.fileExists(atPath: chunkManifest.path) ? chunkManifest : nil
+            )
         } catch {
+            if cancellationRequested {
+                cancellationRequested = false
+                conversionState = .idle
+                setProgress(fraction: 0, title: "Cancelled", detail: "Conversion was cancelled.", allowDecrease: true)
+                appendLog("Conversion cancelled.")
+                return
+            }
             conversionState = .failed(error.localizedDescription)
             setProgress(fraction: progressFraction, title: "Failed", detail: error.localizedDescription)
             appendLog("Failed: \(error.localizedDescription)")
         }
     }
 
-    private func ensureRuntimeReady() async throws {
+    func ensureRuntimeReady() async throws {
         try AppPaths.createMutableDirectories()
 
         let missingBootstrapRequirements = AppPaths.missingBootstrapRequirements()
@@ -321,7 +463,7 @@ final class AudiobookController: ObservableObject {
         }
     }
 
-    private func startServerProcess() throws {
+    func startServerProcess() throws {
         guard serverProcess == nil else { return }
 
         let missing = AppPaths.missingRequirements()
@@ -329,7 +471,13 @@ final class AudiobookController: ObservableObject {
             throw AppError.message("Missing required file: \(missing.first ?? "")")
         }
 
+        serverStartCancelled = false
         serverState = .starting
+        setProgress(
+            fraction: max(progressFraction, 0.09),
+            title: "Starting Voice Engine",
+            detail: "The first launch downloads a large speech model and can take a while."
+        )
         appendLog("Starting Qwen server...")
         logDiagnosticsIfNeeded()
 
@@ -348,16 +496,27 @@ final class AudiobookController: ObservableObject {
                 if self.serverState != .external {
                     self.serverState = .stopped
                 }
+                if !self.conversionState.isBusy && !self.serverStartCancelled {
+                    self.setProgress(
+                        fraction: 0,
+                        title: "Voice Engine Stopped",
+                        detail: "Qwen exited with status \(status).",
+                        allowDecrease: true
+                    )
+                }
             }
         )
 
         Task {
-            let ready = await waitForServerReady(timeoutSeconds: 240)
+            let ready = await waitForServerReady()
             if ready {
                 serverState = .running
                 appendLog("Qwen server is ready.")
+                if !conversionState.isBusy {
+                    setProgress(fraction: 1, title: "Voice Engine Ready", detail: "Qwen is ready for conversion.")
+                }
             } else if serverProcess != nil {
-                appendLog("Qwen server did not become ready before timeout.")
+                appendLog("Qwen server startup was cancelled.")
                 stopServer()
             }
         }
@@ -379,7 +538,8 @@ final class AudiobookController: ObservableObject {
                         "--voice-sample",
                         voiceSamplePath,
                         "--voice-transcript-file",
-                        voiceTranscriptPath
+                        voiceTranscriptPath,
+                        "--retain-chunks"
                     ],
                     workingDirectory: runDirectory,
                     environment: AppPaths.converterEnvironment,
@@ -397,10 +557,9 @@ final class AudiobookController: ObservableObject {
         }
     }
 
-    private func validateRequiredFiles() throws {
-        let missing = AppPaths.missingRequirements()
-        guard missing.isEmpty else {
-            throw AppError.message("Missing required file: \(missing.first ?? "")")
+    private func validateInputFiles(bookURL: URL) throws {
+        guard FileManager.default.fileExists(atPath: bookURL.path) else {
+            throw AppError.message("Missing book: \(bookURL.path)")
         }
         guard let voiceSampleURL else {
             throw AppError.message("Choose a voice sample before converting.")
@@ -423,10 +582,22 @@ final class AudiobookController: ObservableObject {
         }
     }
 
+    private func throwIfCancellationRequested() throws {
+        if cancellationRequested {
+            throw CancellationError()
+        }
+    }
+
     private func makeRunDirectory(for bookURL: URL) throws -> URL {
         let stamp = DateFormatter.runStamp.string(from: Date())
         let stem = bookURL.deletingPathExtension().lastPathComponent.sanitizedFileName
-        let url = AppPaths.runRoot.appendingPathComponent("\(stamp)-\(stem)", isDirectory: true)
+        let baseName = "\(stamp)-\(stem)"
+        var url = AppPaths.runRoot.appendingPathComponent(baseName, isDirectory: true)
+        var suffix = 2
+        while FileManager.default.fileExists(atPath: url.path) {
+            url = AppPaths.runRoot.appendingPathComponent("\(baseName)-\(suffix)", isDirectory: true)
+            suffix += 1
+        }
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
     }
@@ -452,34 +623,47 @@ final class AudiobookController: ObservableObject {
     private func copyOutput(_ generatedFile: URL, originalBook: URL) throws -> URL {
         let stem = originalBook.deletingPathExtension().lastPathComponent.sanitizedFileName
         let stamp = DateFormatter.outputStamp.string(from: Date())
-        let destination = outputFolderURL.appendingPathComponent("\(stem)-qwen-\(stamp).wav")
-        if FileManager.default.fileExists(atPath: destination.path) {
-            try FileManager.default.removeItem(at: destination)
+        let baseName = "\(stem)-qwen-\(stamp)"
+        var destination = outputFolderURL.appendingPathComponent("\(baseName).wav")
+        var suffix = 2
+        while FileManager.default.fileExists(atPath: destination.path) {
+            destination = outputFolderURL.appendingPathComponent("\(baseName)-\(suffix).wav")
+            suffix += 1
         }
         try FileManager.default.copyItem(at: generatedFile, to: destination)
         return destination
     }
 
-    private func waitForServerReady(timeoutSeconds: Int) async -> Bool {
-        let deadline = Date().addingTimeInterval(TimeInterval(timeoutSeconds))
-        while Date() < deadline {
+    func waitForServerReady() async -> Bool {
+        while true {
+            guard !Task.isCancelled,
+                  !serverStartCancelled,
+                  !cancellationRequested,
+                  serverProcess != nil
+            else {
+                return false
+            }
             if await isServerReady() {
                 return true
             }
-            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            do {
+                try await Task.sleep(nanoseconds: 2_000_000_000)
+            } catch {
+                return false
+            }
         }
-        return false
     }
 
-    private func isServerReady() async -> Bool {
+    func isServerReady() async -> Bool {
         guard let url = URL(string: "http://127.0.0.1:7860/gradio_api/info") else {
             return false
         }
         var request = URLRequest(url: url)
         request.timeoutInterval = 2
         do {
-            let (_, response) = try await URLSession.shared.data(for: request)
+            let (data, response) = try await URLSession.shared.data(for: request)
             return (response as? HTTPURLResponse)?.statusCode == 200
+                && ServerProbe.isCompatibleInfo(data)
         } catch {
             return false
         }
@@ -609,7 +793,7 @@ final class AudiobookController: ObservableObject {
         return values.isEmpty ? nil : values
     }
 
-    private func setProgress(fraction: Double, title: String, detail: String, allowDecrease: Bool = false) {
+    func setProgress(fraction: Double, title: String, detail: String, allowDecrease: Bool = false) {
         let clamped = min(max(fraction, 0), 1)
         progressFraction = allowDecrease ? clamped : max(progressFraction, clamped)
         progressTitle = title
@@ -626,7 +810,7 @@ final class AudiobookController: ObservableObject {
         appendLog("  Server script: \(AppPaths.serverScript.path)")
 
         appendLog("  Python runtime: bundled or app-managed")
-        appendLog("  External SoX/ffmpeg: not required")
+        appendLog("  Audio tools: bundled FFmpeg/FFprobe")
 
         do {
             let script = try String(contentsOf: AppPaths.serverScript, encoding: .utf8)

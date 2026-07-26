@@ -10,12 +10,18 @@ enum AppPaths {
         .appendingPathComponent("Runtime", isDirectory: true)
 
     static let bootstrapScript = bundledRuntime.appendingPathComponent("bootstrap_runtime.sh")
+    static let auditBootstrapScript = bundledRuntime.appendingPathComponent("bootstrap_audit_runtime.sh")
     static let serverScript = bundledRuntime.appendingPathComponent("start_qwen_tts_server.sh")
     static let python = applicationSupport.appendingPathComponent("venvs/qwen-converter/bin/python")
+    static let auditPython = applicationSupport.appendingPathComponent("venvs/parakeet-audit/bin/python")
     static let qwenServerExecutable = applicationSupport.appendingPathComponent("venvs/qwen-tts/bin/qwen-tts-demo")
     static let converter = bundledRuntime.appendingPathComponent("Qwen3-Audiobook-Converter/audiobook_converter.py")
+    static let qualityEngine = bundledRuntime.appendingPathComponent("audiobook_quality.py")
+    static let ffmpeg = bundledRuntime.appendingPathComponent("bin/ffmpeg")
+    static let ffprobe = bundledRuntime.appendingPathComponent("bin/ffprobe")
     static let cache = applicationSupport.appendingPathComponent("cache", isDirectory: true)
     static let runRoot = applicationSupport.appendingPathComponent("gui_runs", isDirectory: true)
+    static let auditRunRoot = applicationSupport.appendingPathComponent("audit_sessions", isDirectory: true)
 
     private static let standardExecutablePath = [
         "/opt/homebrew/bin",
@@ -41,10 +47,13 @@ enum AppPaths {
         environment["QWEN_TTS_BIN"] = qwenServerExecutable.path
         environment["QWEN_TTS_PYTHON"] = applicationSupport.appendingPathComponent("venvs/qwen-tts/bin/python").path
         environment["HF_HOME"] = cache.appendingPathComponent("huggingface", isDirectory: true).path
+        environment["HF_HUB_DISABLE_XET"] = "1"
         environment["XDG_CACHE_HOME"] = cache.path
         environment["MPLCONFIGDIR"] = cache.appendingPathComponent("matplotlib", isDirectory: true).path
+        environment["NUMBA_CACHE_DIR"] = cache.appendingPathComponent("numba", isDirectory: true).path
         environment["PIP_CACHE_DIR"] = cache.appendingPathComponent("pip", isDirectory: true).path
         environment["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
         environment["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
         if let existingPath = environment["PATH"], !existingPath.isEmpty {
             environment["PATH"] = "\(standardExecutablePath):\(existingPath)"
@@ -66,19 +75,29 @@ enum AppPaths {
             withIntermediateDirectories: true
         )
         try FileManager.default.createDirectory(
+            at: cache.appendingPathComponent("numba", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
             at: cache.appendingPathComponent("pip", isDirectory: true),
             withIntermediateDirectories: true
         )
         try FileManager.default.createDirectory(at: runRoot, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: auditRunRoot, withIntermediateDirectories: true)
     }
 
     static func missingBootstrapRequirements() -> [String] {
         [
             bootstrapScript,
+            auditBootstrapScript,
             serverScript,
             converter,
+            qualityEngine,
+            ffmpeg,
+            ffprobe,
             bundledRuntime.appendingPathComponent("requirements-converter.txt"),
-            bundledRuntime.appendingPathComponent("requirements-qwen-tts.txt")
+            bundledRuntime.appendingPathComponent("requirements-qwen-tts.txt"),
+            bundledRuntime.appendingPathComponent("requirements-audit.txt")
         ].filter { !FileManager.default.fileExists(atPath: $0.path) }
             .map(\.path)
     }
@@ -90,6 +109,15 @@ enum AppPaths {
             qwenServerExecutable,
             converter
         ].filter { !FileManager.default.fileExists(atPath: $0.path) }
+            .map(\.path)
+    }
+
+    static func missingAuditRequirements(includePython: Bool = true) -> [String] {
+        var requirements = [qualityEngine, ffmpeg, ffprobe]
+        if includePython {
+            requirements.append(auditPython)
+        }
+        return requirements.filter { !FileManager.default.fileExists(atPath: $0.path) }
             .map(\.path)
     }
 }

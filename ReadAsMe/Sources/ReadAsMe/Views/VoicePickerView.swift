@@ -28,6 +28,11 @@ struct VoicePickerView: View {
                     Label("Choose Audio", systemImage: "waveform.badge.plus")
                         .frame(maxWidth: .infinity)
                 }
+
+                Text("Use clean, expressive solo speech. ReadAsMe follows the sample's delivery, so a flat sample produces flat narration.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             VStack(alignment: .leading, spacing: 6) {
@@ -70,5 +75,6 @@ struct VoicePickerView: View {
                 }
             }
         }
+        .disabled(controller.conversionState.isBusy || controller.auditState.isBusy)
     }
 }

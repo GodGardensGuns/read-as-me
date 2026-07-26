@@ -16,7 +16,7 @@ struct ReadAsMeApp: App {
     var body: some Scene {
         WindowGroup("ReadAsMe") {
             ContentView(controller: controller)
-                .frame(minWidth: 820, minHeight: 640)
+                .frame(minWidth: 1080, minHeight: 700)
                 .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
                     controller.terminateOwnedProcesses()
                 }
@@ -28,6 +28,7 @@ struct ReadAsMeApp: App {
                     controller.chooseBook()
                 }
                 .keyboardShortcut("o", modifiers: [.command])
+                .disabled(controller.conversionState.isBusy)
 
                 Button("Convert") {
                     controller.convertSelectedBook()
@@ -35,31 +36,68 @@ struct ReadAsMeApp: App {
                 .keyboardShortcut("r", modifiers: [.command])
                 .disabled(!controller.canConvert)
 
+                Button("Audit Existing Audiobook") {
+                    controller.workflowMode = .auditExisting
+                    controller.chooseAuditAudio()
+                }
+                .keyboardShortcut("a", modifiers: [.command, .shift])
+                .disabled(controller.auditState.isBusy || controller.conversionState.isBusy)
+
+                if controller.selectedAuditAudioURL != nil {
+                    Button("Start Audit") {
+                        controller.startExistingAudit()
+                    }
+                    .keyboardShortcut("u", modifiers: [.command])
+                    .disabled(!controller.canStartExistingAudit)
+                }
+
+                if controller.latestMarkdownReportURL != nil {
+                    Button("Open Audit Report") {
+                        controller.openAuditReport()
+                    }
+                }
+
                 Divider()
 
                 Button("Choose Voice Sample") {
                     controller.chooseVoiceSample()
                 }
+                .disabled(controller.conversionState.isBusy)
 
                 Button("Choose Voice Transcript") {
                     controller.chooseVoiceTranscript()
                 }
+                .disabled(controller.conversionState.isBusy)
 
                 Button("Clear Voice Selection") {
                     controller.clearVoiceSelection()
                 }
+                .disabled(controller.conversionState.isBusy)
 
                 Divider()
 
                 Button("Start Voice Engine") {
                     controller.startServer()
                 }
-                .disabled(controller.serverState != .stopped)
+                .disabled(controller.serverState != .stopped || controller.conversionState.isBusy || controller.auditState.isBusy)
 
                 Button("Stop Voice Engine") {
                     controller.stopServer()
                 }
-                .disabled(controller.serverState == .stopped)
+                .disabled(
+                    controller.serverState == .stopped
+                        || controller.serverState == .external
+                        || controller.conversionState.isBusy
+                        || controller.auditState.isBusy
+                )
+
+                if controller.auditState.isBusy {
+                    Divider()
+                    Button("Cancel Quality Operation") {
+                        controller.cancelQualityOperation()
+                    }
+                    .keyboardShortcut(.cancelAction)
+                }
             }
         }
     }

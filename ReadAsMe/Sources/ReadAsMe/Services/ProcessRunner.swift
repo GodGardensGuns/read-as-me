@@ -43,8 +43,18 @@ enum ProcessRunner {
         process.terminationHandler = { process in
             outputPipe.fileHandleForReading.readabilityHandler = nil
             errorPipe.fileHandleForReading.readabilityHandler = nil
-            if let onTermination {
-                Task { @MainActor in
+
+            let remainingOutput = outputPipe.fileHandleForReading.readDataToEndOfFile()
+            let remainingError = errorPipe.fileHandleForReading.readDataToEndOfFile()
+
+            Task { @MainActor in
+                if !remainingOutput.isEmpty {
+                    onOutput(String(decoding: remainingOutput, as: UTF8.self))
+                }
+                if !remainingError.isEmpty {
+                    onOutput(String(decoding: remainingError, as: UTF8.self))
+                }
+                if let onTermination {
                     onTermination(process.terminationStatus)
                 }
             }
