@@ -75,6 +75,6 @@ struct VoicePickerView: View {
                 }
             }
         }
-        .disabled(controller.conversionState.isBusy || controller.auditState.isBusy)
+        .disabled(controller.conversionState.isBusy)
     }
 }

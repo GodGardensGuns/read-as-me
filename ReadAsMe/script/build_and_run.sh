@@ -4,8 +4,8 @@ set -euo pipefail
 MODE="${1:-run}"
 APP_NAME="ReadAsMe"
 BUNDLE_ID="com.godgardensguns.ReadAsMe"
-APP_VERSION="0.2.2"
-BUILD_VERSION="7"
+APP_VERSION="0.3.0"
+BUILD_VERSION="8"
 MIN_SYSTEM_VERSION="14.0"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -119,9 +119,8 @@ find "$APP_RUNTIME" -type d -name '__pycache__' -empty -delete
 
 chmod +x \
   "$APP_RUNTIME/bootstrap_runtime.sh" \
-  "$APP_RUNTIME/bootstrap_audit_runtime.sh" \
   "$APP_RUNTIME/start_qwen_tts_server.sh" \
-  "$APP_RUNTIME/audiobook_quality.py" \
+  "$APP_RUNTIME/source_text_review.py" \
   "$APP_RUNTIME/bin/ffmpeg" \
   "$APP_RUNTIME/bin/ffprobe"
 

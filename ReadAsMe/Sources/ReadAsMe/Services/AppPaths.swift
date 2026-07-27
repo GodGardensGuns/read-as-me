@@ -10,18 +10,15 @@ enum AppPaths {
         .appendingPathComponent("Runtime", isDirectory: true)
 
     static let bootstrapScript = bundledRuntime.appendingPathComponent("bootstrap_runtime.sh")
-    static let auditBootstrapScript = bundledRuntime.appendingPathComponent("bootstrap_audit_runtime.sh")
     static let serverScript = bundledRuntime.appendingPathComponent("start_qwen_tts_server.sh")
     static let python = applicationSupport.appendingPathComponent("venvs/qwen-converter/bin/python")
-    static let auditPython = applicationSupport.appendingPathComponent("venvs/parakeet-audit/bin/python")
     static let qwenServerExecutable = applicationSupport.appendingPathComponent("venvs/qwen-tts/bin/qwen-tts-demo")
     static let converter = bundledRuntime.appendingPathComponent("Qwen3-Audiobook-Converter/audiobook_converter.py")
-    static let qualityEngine = bundledRuntime.appendingPathComponent("audiobook_quality.py")
+    static let sourceReviewEngine = bundledRuntime.appendingPathComponent("source_text_review.py")
     static let ffmpeg = bundledRuntime.appendingPathComponent("bin/ffmpeg")
     static let ffprobe = bundledRuntime.appendingPathComponent("bin/ffprobe")
     static let cache = applicationSupport.appendingPathComponent("cache", isDirectory: true)
     static let runRoot = applicationSupport.appendingPathComponent("gui_runs", isDirectory: true)
-    static let auditRunRoot = applicationSupport.appendingPathComponent("audit_sessions", isDirectory: true)
 
     private static let standardExecutablePath = [
         "/opt/homebrew/bin",
@@ -83,21 +80,18 @@ enum AppPaths {
             withIntermediateDirectories: true
         )
         try FileManager.default.createDirectory(at: runRoot, withIntermediateDirectories: true)
-        try FileManager.default.createDirectory(at: auditRunRoot, withIntermediateDirectories: true)
     }
 
     static func missingBootstrapRequirements() -> [String] {
         [
             bootstrapScript,
-            auditBootstrapScript,
             serverScript,
             converter,
-            qualityEngine,
+            sourceReviewEngine,
             ffmpeg,
             ffprobe,
             bundledRuntime.appendingPathComponent("requirements-converter.txt"),
-            bundledRuntime.appendingPathComponent("requirements-qwen-tts.txt"),
-            bundledRuntime.appendingPathComponent("requirements-audit.txt")
+            bundledRuntime.appendingPathComponent("requirements-qwen-tts.txt")
         ].filter { !FileManager.default.fileExists(atPath: $0.path) }
             .map(\.path)
     }
@@ -112,12 +106,4 @@ enum AppPaths {
             .map(\.path)
     }
 
-    static func missingAuditRequirements(includePython: Bool = true) -> [String] {
-        var requirements = [qualityEngine, ffmpeg, ffprobe]
-        if includePython {
-            requirements.append(auditPython)
-        }
-        return requirements.filter { !FileManager.default.fileExists(atPath: $0.path) }
-            .map(\.path)
-    }
 }

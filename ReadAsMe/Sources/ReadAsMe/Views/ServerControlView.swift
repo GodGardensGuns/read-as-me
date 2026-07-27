@@ -15,7 +15,7 @@ struct ServerControlView: View {
                     Label("Start", systemImage: "play.fill")
                         .frame(maxWidth: .infinity)
                 }
-                .disabled(controller.serverState != .stopped || controller.conversionState.isBusy || controller.auditState.isBusy)
+                .disabled(controller.serverState != .stopped || controller.conversionState.isBusy)
 
                 Button {
                     controller.stopServer()
@@ -27,7 +27,6 @@ struct ServerControlView: View {
                     controller.serverState == .stopped
                         || controller.serverState == .external
                         || controller.conversionState.isBusy
-                        || controller.auditState.isBusy
                 )
             }
 

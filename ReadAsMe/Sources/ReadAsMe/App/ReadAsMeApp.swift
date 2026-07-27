@@ -36,29 +36,6 @@ struct ReadAsMeApp: App {
                 .keyboardShortcut("r", modifiers: [.command])
                 .disabled(!controller.canConvert)
 
-                Button("Audit Existing Audiobook") {
-                    controller.workflowMode = .auditExisting
-                    controller.chooseAuditAudio()
-                }
-                .keyboardShortcut("a", modifiers: [.command, .shift])
-                .disabled(controller.auditState.isBusy || controller.conversionState.isBusy)
-
-                if controller.selectedAuditAudioURL != nil {
-                    Button("Start Audit") {
-                        controller.startExistingAudit()
-                    }
-                    .keyboardShortcut("u", modifiers: [.command])
-                    .disabled(!controller.canStartExistingAudit)
-                }
-
-                if controller.latestMarkdownReportURL != nil {
-                    Button("Open Audit Report") {
-                        controller.openAuditReport()
-                    }
-                }
-
-                Divider()
-
                 Button("Choose Voice Sample") {
                     controller.chooseVoiceSample()
                 }
@@ -79,7 +56,7 @@ struct ReadAsMeApp: App {
                 Button("Start Voice Engine") {
                     controller.startServer()
                 }
-                .disabled(controller.serverState != .stopped || controller.conversionState.isBusy || controller.auditState.isBusy)
+                .disabled(controller.serverState != .stopped || controller.conversionState.isBusy)
 
                 Button("Stop Voice Engine") {
                     controller.stopServer()
@@ -88,16 +65,7 @@ struct ReadAsMeApp: App {
                     controller.serverState == .stopped
                         || controller.serverState == .external
                         || controller.conversionState.isBusy
-                        || controller.auditState.isBusy
                 )
-
-                if controller.auditState.isBusy {
-                    Divider()
-                    Button("Cancel Quality Operation") {
-                        controller.cancelQualityOperation()
-                    }
-                    .keyboardShortcut(.cancelAction)
-                }
             }
         }
     }

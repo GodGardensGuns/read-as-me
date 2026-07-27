@@ -47,7 +47,7 @@ if sys.platform == 'win32':
 
 # Qwen API Configuration
 QWEN_API_URL = "http://127.0.0.1:7860"
-API_TIMEOUT = 900
+API_TIMEOUT = 1200
 MAX_RETRIES = 3
 
 # Hardcoded Voice Settings (Always use 1.7B model)
@@ -140,12 +140,10 @@ class QwenAudiobookConverter:
         voice_mode: str = "custom_voice",
         voice_clone_ref_audio: Optional[str] = None,
         voice_clone_ref_text: Optional[str] = None,
-        retain_chunks: bool = False,
     ):
         self.voice_mode = voice_mode
         self.voice_clone_ref_audio = voice_clone_ref_audio
         self.voice_clone_ref_text = (voice_clone_ref_text or "").strip()
-        self.retain_chunks = retain_chunks
         self.voice_clone_use_xvector_only = VOICE_CLONE_USE_XVECTOR_ONLY
         self.setup_logging()
         self.setup_directories()
@@ -169,7 +167,7 @@ class QwenAudiobookConverter:
 
     def setup_directories(self):
         """Create necessary directories"""
-        directories = [BOOKS_FOLDER, AUDIOBOOKS_FOLDER, "chunks", "cache/audio_chunks", "logs"]
+        directories = [BOOKS_FOLDER, AUDIOBOOKS_FOLDER, "chunks", self.cache_directory(), "logs"]
         for directory in directories:
             Path(directory).mkdir(parents=True, exist_ok=True)
 
@@ -374,6 +372,7 @@ class QwenAudiobookConverter:
             time.sleep(MIN_DELAY_BETWEEN_CHUNKS)
 
         for attempt in range(MAX_RETRIES):
+            retry_delay = 5 + (2 ** attempt)
             try:
                 result = self.generate_chunk_via_qwen(text, chunk_num)
                 if result and Path(result).exists():
@@ -381,15 +380,17 @@ class QwenAudiobookConverter:
                 else:
                     self.logger.warning(f"Chunk {chunk_num} attempt {attempt + 1} failed")
             except QwenRequestTimeout as e:
-                self.logger.error(f"Chunk {chunk_num} timed out: {e}")
-                return False
+                retry_delay = 30
+                self.logger.warning(
+                    f"Chunk {chunk_num} attempt {attempt + 1} reached the time limit: {e}. "
+                    "The completed chunks are safe and this chunk will be retried."
+                )
             except Exception as e:
                 self.logger.warning(f"Chunk {chunk_num} attempt {attempt + 1} error: {e}")
 
             if attempt < MAX_RETRIES - 1:
-                sleep_time = 5 + (2 ** attempt)
-                self.logger.info(f"Waiting {sleep_time}s before retry...")
-                time.sleep(sleep_time)
+                self.logger.info(f"Waiting {retry_delay}s before retry...")
+                time.sleep(retry_delay)
 
         self.logger.error(f"Chunk {chunk_num} failed after {MAX_RETRIES} attempts")
         return False
@@ -401,10 +402,39 @@ class QwenAudiobookConverter:
         else:
             ref_name = Path(self.voice_clone_ref_audio).name if self.voice_clone_ref_audio else ""
             transcript_hash = hashlib.md5(self.voice_clone_ref_text.encode()).hexdigest()
-            voice_key = f"{ref_name}_{transcript_hash}_xvec_{self.voice_clone_use_xvector_only}"
+            reference_hash = self._voice_reference_fingerprint()
+            voice_key = (
+                f"{ref_name}_{reference_hash}_{transcript_hash}"
+                f"_xvec_{self.voice_clone_use_xvector_only}"
+            )
         content = f"{text}_{self.voice_mode}_{voice_key}_{VOICE_GENERATION_PROFILE}"
         hash_obj = hashlib.md5(content.encode())
-        return Path("cache/audio_chunks") / f"{hash_obj.hexdigest()}.wav"
+        return self.cache_directory() / f"{hash_obj.hexdigest()}.wav"
+
+    def _voice_reference_fingerprint(self) -> str:
+        """Identify the actual sample audio so cached voices cannot collide by filename."""
+        cached = getattr(self, "_cached_voice_reference_fingerprint", None)
+        if cached:
+            return cached
+
+        digest = hashlib.sha256()
+        try:
+            with open(self.voice_clone_ref_audio, "rb") as reference_audio:
+                for block in iter(lambda: reference_audio.read(1024 * 1024), b""):
+                    digest.update(block)
+            fingerprint = digest.hexdigest()
+        except (OSError, TypeError):
+            fingerprint = Path(self.voice_clone_ref_audio).name if self.voice_clone_ref_audio else "missing"
+
+        self._cached_voice_reference_fingerprint = fingerprint
+        return fingerprint
+
+    def cache_directory(self) -> Path:
+        """Use persistent app cache when running in ReadAsMe, local cache otherwise."""
+        app_support = os.environ.get("READ_AS_ME_APP_SUPPORT") or os.environ.get("QWEN_AUDIOBOOK_APP_SUPPORT")
+        if app_support:
+            return Path(app_support) / "cache" / "qwen-audio-chunks"
+        return Path("cache/audio_chunks")
 
     def extract_text_from_epub(self, file_path: Path) -> str:
         """Extract text from EPUB with fallback methods"""
@@ -718,8 +748,13 @@ class QwenAudiobookConverter:
             self.logger.error(traceback.format_exc())
             return False
 
-    def cleanup_chunks(self):
-        """Remove temporary chunk files and cache"""
+    def cleanup_chunks(
+        self,
+        *,
+        clear_cache: bool = True,
+        cached_texts: Optional[List[str]] = None,
+    ):
+        """Remove temporary chunks and optionally this book's resume cache."""
         try:
             # Clean up chunks folder
             chunk_count = 0
@@ -732,18 +767,27 @@ class QwenAudiobookConverter:
             
             # Clean up cache folder
             cache_count = 0
-            cache_dir = Path("cache/audio_chunks")
-            if cache_dir.exists():
-                for cache_file in cache_dir.glob("*.wav"):
+            cache_dir = self.cache_directory()
+            if clear_cache and cache_dir.exists():
+                cache_files = (
+                    [self.get_cache_path(text) for text in cached_texts]
+                    if cached_texts is not None
+                    else list(cache_dir.glob("*.wav"))
+                )
+                for cache_file in cache_files:
                     try:
-                        cache_file.unlink()
-                        cache_count += 1
+                        if cache_file.exists():
+                            cache_file.unlink()
+                            cache_count += 1
                     except Exception as e:
                         self.logger.warning(f"Failed to delete cache file {cache_file}: {e}")
             
             if chunk_count > 0 or cache_count > 0:
                 self.logger.info(f"Cleaned up {chunk_count} chunk files and {cache_count} cache files")
                 print(f"[INFO] Cleaned up {chunk_count} chunk files and {cache_count} cache files")
+            if not clear_cache:
+                self.logger.info(f"Preserved completed audio in resume cache: {cache_dir}")
+                print("[INFO] Completed chunks were preserved. Run the same conversion again to resume.")
         except Exception as e:
             self.logger.warning(f"Cleanup failed: {e}")
 
@@ -846,7 +890,7 @@ class QwenAudiobookConverter:
 
             if successful_chunks == 0:
                 self.logger.error("No chunks were successfully processed")
-                self.cleanup_chunks()  # Cleanup even on failure
+                self.cleanup_chunks(clear_cache=False)
                 return False
 
             if successful_chunks < total_chunks:
@@ -856,9 +900,9 @@ class QwenAudiobookConverter:
                 )
                 print(
                     f"[FAIL] {total_chunks - successful_chunks} chunk(s) failed; "
-                    "the audiobook was not created."
+                    "the audiobook was not created yet."
                 )
-                self.cleanup_chunks()
+                self.cleanup_chunks(clear_cache=False)
                 return False
 
             # Combine only after every chunk has succeeded.
@@ -888,17 +932,14 @@ class QwenAudiobookConverter:
             else:
                 self.logger.error("Failed to combine chunks into final audiobook")
 
-            # Keep successful chunks for ReadAsMe's audit/repair session when requested.
-            if not (success and self.retain_chunks):
-                self.cleanup_chunks()
+            self.cleanup_chunks(clear_cache=success, cached_texts=chunks if success else None)
             return success
 
         except Exception as e:
             self.logger.error(f"Conversion failed: {e}")
             import traceback
             self.logger.error(traceback.format_exc())
-            # Cleanup on exception
-            self.cleanup_chunks()
+            self.cleanup_chunks(clear_cache=False)
             return False
 
     def run(self) -> bool:
@@ -1015,12 +1056,6 @@ Examples:
         help="Path to exact transcript text for the reference audio. Improves voice cloning and avoids x-vector-only mode."
     )
 
-    parser.add_argument(
-        "--retain-chunks",
-        action="store_true",
-        help="Keep generated chunk audio and chunks/manifest.json for post-generation auditing."
-    )
-    
     args = parser.parse_args()
     
     # Determine voice mode
@@ -1051,7 +1086,6 @@ Examples:
             voice_mode=voice_mode,
             voice_clone_ref_audio=voice_clone_ref_audio,
             voice_clone_ref_text=voice_clone_ref_text,
-            retain_chunks=args.retain_chunks,
         )
         if not converter.run():
             sys.exit(1)

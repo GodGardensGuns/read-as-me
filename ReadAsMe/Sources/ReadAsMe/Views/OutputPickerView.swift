@@ -17,7 +17,7 @@ struct OutputPickerView: View {
                     Label("Choose", systemImage: "folder.badge.gearshape")
                         .frame(maxWidth: .infinity)
                 }
-                .disabled(controller.conversionState.isBusy || controller.auditState.isBusy)
+                .disabled(controller.conversionState.isBusy)
 
                 Button {
                     controller.openOutputFolder()

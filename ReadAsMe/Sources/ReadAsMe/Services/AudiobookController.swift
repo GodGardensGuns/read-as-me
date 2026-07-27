@@ -1,5 +1,4 @@
 import AppKit
-import AVFoundation
 import Foundation
 import SwiftUI
 import UniformTypeIdentifiers
@@ -21,28 +20,12 @@ final class AudiobookController: ObservableObject {
     @Published var progressDetail: String = "Choose a book to convert."
     @Published var completedChunks: Int = 0
     @Published var totalChunks: Int = 0
-    @Published var workflowMode: WorkflowMode = .generate
-    @Published var selectedAuditAudioURL: URL?
-    @Published var selectedExpectedTextURL: URL?
-    @Published var qualityProfile: QualityProfile = .natural
-    @Published var outputSameFormat: Bool = true
-    @Published var auditState: AuditState = .idle
-    @Published var auditReport: AuditReport?
-    @Published var selectedFindingIDs: Set<String> = []
-    @Published var latestAuditReportURL: URL?
-    @Published var latestMarkdownReportURL: URL?
-    @Published var latestRepairedOutputURL: URL?
-    @Published var auditModelNoticeAccepted = false
     @Published var isShowingSourceReview = false
     @Published var sourceTextSuggestions: [SourceTextSuggestion] = []
 
     var serverProcess: RunningProcess?
     private var converterProcess: RunningProcess?
     private var bootstrapProcess: RunningProcess?
-    var qualityProcess: RunningProcess?
-    var auditBootstrapProcess: RunningProcess?
-    var qualityOutputBuffer = ""
-    var auditPlayer: AVPlayer?
     var sourceReviewProcess: RunningProcess?
     var sourceReviewContinuation: CheckedContinuation<[SourceTextSuggestion], Never>?
     var sourceReviewText = ""
@@ -56,14 +39,6 @@ final class AudiobookController: ObservableObject {
             && hasUsableTranscript
             && !conversionState.isBusy
             && serverState != .starting
-    }
-
-    var canStartExistingAudit: Bool {
-        guard let selectedAuditAudioURL else { return false }
-        return FileManager.default.fileExists(atPath: selectedAuditAudioURL.path)
-            && !auditState.isBusy
-            && !conversionState.isBusy
-            && auditModelNoticeAccepted
     }
 
     private var hasSelectedBook: Bool {
@@ -112,15 +87,6 @@ final class AudiobookController: ObservableObject {
             selectedBookURL = panel.url
             appendLog("Selected book: \(panel.url?.lastPathComponent ?? "")")
         }
-    }
-
-    func workflowDidChange() {
-        guard !conversionState.isBusy, !auditState.isBusy, auditReport == nil else { return }
-        progressFraction = 0
-        progressTitle = "Ready"
-        progressDetail = workflowMode == .generate
-            ? "Choose a book to convert."
-            : "Choose an audiobook to audit."
     }
 
     func chooseVoiceSample() {
@@ -223,15 +189,6 @@ final class AudiobookController: ObservableObject {
 
     func convertSelectedBook() {
         guard let selectedBookURL, !conversionState.isBusy else { return }
-        if !auditModelNoticeAccepted {
-            let alert = NSAlert()
-            alert.messageText = "Enable automatic audiobook quality checks?"
-            alert.informativeText = "The first quality check installs NVIDIA Parakeet and downloads about 2.5 GB of model data. Analysis stays on this Mac."
-            alert.addButton(withTitle: "Enable and Continue")
-            alert.addButton(withTitle: "Cancel")
-            guard alert.runModal() == .alertFirstButtonReturn else { return }
-            auditModelNoticeAccepted = true
-        }
         Task {
             await convert(bookURL: selectedBookURL)
         }
@@ -263,20 +220,6 @@ final class AudiobookController: ObservableObject {
         )
     }
 
-    func cancelQualityOperation() {
-        guard auditState.isBusy else { return }
-        cancellationRequested = true
-        qualityProcess?.process.terminate()
-        qualityProcess = nil
-        sourceReviewProcess?.process.terminate()
-        sourceReviewProcess = nil
-        sourceReviewContinuation?.resume(returning: [])
-        sourceReviewContinuation = nil
-        auditBootstrapProcess?.process.terminate()
-        auditBootstrapProcess = nil
-        setProgress(fraction: progressFraction, title: "Cancelling", detail: "Stopping the quality operation.")
-    }
-
     func openOutputFolder() {
         NSWorkspace.shared.open(outputFolderURL)
     }
@@ -293,10 +236,6 @@ final class AudiobookController: ObservableObject {
         converterProcess = nil
         bootstrapProcess?.process.terminate()
         bootstrapProcess = nil
-        auditBootstrapProcess?.process.terminate()
-        auditBootstrapProcess = nil
-        qualityProcess?.process.terminate()
-        qualityProcess = nil
         serverProcess?.process.terminate()
         serverProcess = nil
     }
@@ -352,7 +291,6 @@ final class AudiobookController: ObservableObject {
             let runTranscript = try transcriptURLForConversion(in: runDirectory)
 
             let reviewPayload = try await reviewSourceText(bookURL, in: runDirectory)
-            var auditExpectedTextURL: URL = bookURL
             if !reviewPayload.suggestions.isEmpty {
                 sourceReviewText = reviewPayload.text
                 let reviewedSuggestions = await waitForSourceTextReview(reviewPayload.suggestions)
@@ -361,7 +299,6 @@ final class AudiobookController: ObservableObject {
                     let reviewedBook = bookFolder.appendingPathComponent("reviewed-\(bookURL.deletingPathExtension().lastPathComponent).txt")
                     try applySourceSuggestions(accepted, to: reviewPayload.text)
                         .write(to: reviewedBook, atomically: true, encoding: .utf8)
-                    auditExpectedTextURL = reviewedBook
                     appendLog("Applied \(accepted.count) reviewed source-text corrections to the staged copy.")
                 } else {
                     let stagedBook = bookFolder.appendingPathComponent(bookURL.lastPathComponent)
@@ -391,14 +328,8 @@ final class AudiobookController: ObservableObject {
             let finalOutput = try copyOutput(generatedFile, originalBook: bookURL)
             latestOutputURL = finalOutput
             conversionState = .complete(finalOutput)
-            setProgress(fraction: 1, title: "Audio Saved", detail: "Starting the automatic quality check.")
+            setProgress(fraction: 1, title: "Audio Saved", detail: finalOutput.lastPathComponent)
             appendLog("Saved: \(finalOutput.path)")
-            let chunkManifest = runDirectory.appendingPathComponent("chunks/manifest.json")
-            await startGeneratedAudit(
-                audioURL: finalOutput,
-                expectedTextURL: auditExpectedTextURL,
-                generatedChunksURL: FileManager.default.fileExists(atPath: chunkManifest.path) ? chunkManifest : nil
-            )
         } catch {
             if cancellationRequested {
                 cancellationRequested = false
@@ -538,8 +469,7 @@ final class AudiobookController: ObservableObject {
                         "--voice-sample",
                         voiceSamplePath,
                         "--voice-transcript-file",
-                        voiceTranscriptPath,
-                        "--retain-chunks"
+                        voiceTranscriptPath
                     ],
                     workingDirectory: runDirectory,
                     environment: AppPaths.converterEnvironment,

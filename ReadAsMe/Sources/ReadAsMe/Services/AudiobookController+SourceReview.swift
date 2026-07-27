@@ -35,8 +35,7 @@ extension AudiobookController {
                 sourceReviewProcess = try ProcessRunner.start(
                     executable: AppPaths.python,
                     arguments: [
-                        AppPaths.qualityEngine.path,
-                        "review-source",
+                        AppPaths.sourceReviewEngine.path,
                         "--source",
                         source.path,
                         "--output",
